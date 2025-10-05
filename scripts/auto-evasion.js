@@ -1,150 +1,207 @@
-// CPRED Auto Evasion — Diagnostic v4 (Foundry V12)
+// CPRED Auto Evasion — Diagnostic v5 (Foundry V12)
 // -------------------------------------------------
-// Works on Forge / CPRED when you click the fist on the SHEET (no separate roll message),
-// and when the system does Card → Roll chat flow.
+// What’s new:
+// - When auto-rolling Evasion, if CPRED APIs don’t return a Roll,
+//   we OPEN THE DEFENDER’S SHEET and CLICK the Evasion button in the UI.
+// - We then CAPTURE the next chat message from that actor that has a numeric total
+//   and post a clean HIT/DODGED summary.
+// - Full logs + toasts; works solo GM or with players.
 //
-// What it does:
-// - Detects melee *cards* (Unarmed/Wolvers/"Melee Weapon") → PENDING → next roll = attack.
-// - Detects *sheet attack clicks* (fist next to the weapon) even if there will be no roll message.
-// - If a roll appears within a grace window, we use it for HIT/DODGED comparison.
-// - Otherwise, we still roll Evasion (no comparison).
-// - Requires EXACTLY ONE target selected on the attacker's client.
-// - Loud toasts + console logs. Fallback chat button if auto-roll fails.
-//
-// Toggle these if you want less noise later.
-const VERBOSE_TOASTS = true;
+// If this still fails, the logs will show exactly which step couldn’t find the Evasion control.
+
 const MOD = "cpred-auto-evasion";
 const SOCKET = `module.${MOD}`;
+const VERBOSE_TOASTS = true;
 
-// ---- Helpers ----
+const info = (m) => VERBOSE_TOASTS && ui.notifications.info(`[${MOD}] ${m}`, { permanent: false });
+const warnN = (m) => ui.notifications.warn(`[${MOD}] ${m}`, { permanent: false });
 const log  = (...a) => console.log(`[${MOD}]`, ...a);
 const warn = (...a) => console.warn(`[${MOD}]`, ...a);
-const info = (m) => VERBOSE_TOASTS && ui.notifications.info(`[${MOD}] ${m}`, { permanent: false });
-const oops = (m) => ui.notifications.warn(`[${MOD}] ${m}`, { permanent: false });
-
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-function extractTotal(msg) { const r = msg?.rolls?.[0]; return (r && typeof r.total === "number") ? r.total : null; }
-function textify(htmlString) {
-  try { const div = document.createElement("div"); div.innerHTML = htmlString ?? ""; return (div.textContent || div.innerText || "").trim(); }
-  catch { return htmlString || ""; }
-}
 
-// ---- Detection constants ----
 const MELEE_WORDS = ["melee weapon", "unarmed", "wolvers"];
-const ROLL_WAIT_MS = 800;   // After sheet click, how long to wait for a roll message to show up
-const PENDING_MS  = 12000;  // For card → roll flow
+const PENDING_MS = 12000;
+const SHEET_ROLL_WAIT_MS = 4000; // wait for evasion chat after clicking sheet
 
-// PENDING for card → roll
 let pendingUntil = 0;
 function setPending() { pendingUntil = Date.now() + PENDING_MS; log(`PENDING SET (${PENDING_MS}ms)`); info("Melee card detected — waiting for the next roll…"); }
 function hasPending() { return Date.now() <= pendingUntil; }
 function clearPending() { pendingUntil = 0; log("PENDING CLEARED"); }
 
-function looksLikeMeleeText(_text) {
-  const t = (_text || "").toLowerCase();
+function textify(htmlString) {
+  try { const div = document.createElement("div"); div.innerHTML = htmlString ?? ""; return (div.textContent || div.innerText || "").trim(); }
+  catch { return htmlString || ""; }
+}
+function looksLikeMeleeText(txt) {
+  const t = (txt || "").toLowerCase();
   if (MELEE_WORDS.some(w => t.includes(w))) return true;
   if (t.includes("melee") && t.includes("rof") && t.includes("damage")) return true;
   return false;
 }
+function extractTotal(msg) { const r = msg?.rolls?.[0]; return (r && typeof r.total === "number") ? r.total : null; }
 
-// ---- Evasion roll strategies ----
-async function rollEvasion(actor, evasionName = "Evasion") {
+// --- Capture the next chat message from a specific actor that contains a numeric total ---
+function captureNextTotalForActor(actor, timeoutMs = 4000) {
+  return new Promise(async (resolve) => {
+    let resolved = false;
+    const off = Hooks.on("createChatMessage", (msg) => {
+      const sameActor =
+        (msg.speaker?.actor === actor.id) ||
+        (msg.speaker?.alias && msg.speaker.alias === actor.name);
+      const total = extractTotal(msg);
+      if (!sameActor || typeof total !== "number") return;
+      if (!resolved) {
+        resolved = true;
+        Hooks.off("createChatMessage", off);
+        resolve(total);
+      }
+    });
+    const start = Date.now();
+    while (!resolved && Date.now() - start < timeoutMs) await sleep(50);
+    if (!resolved) {
+      Hooks.off("createChatMessage", off);
+      resolve(null);
+    }
+  });
+}
+
+// --- Try CPRED API roll helpers first (cheap path) ---
+async function tryAPIEvasionRoll(actor, evasionName = "Evasion") {
+  // A) actor.rollSkill
   if (typeof actor.rollSkill === "function") {
-    try { log(`rollEvasion via actor.rollSkill("${evasionName}")`); return await actor.rollSkill(evasionName); }
+    try { log(`tryAPIEvasionRoll: actor.rollSkill("${evasionName}")`); await actor.rollSkill(evasionName); return true; }
     catch (e) { warn("actor.rollSkill failed", e); }
   }
+  // B) system.skills[*].roll
   const skills = foundry.utils.getProperty(actor, "system.skills") || {};
   const key = Object.keys(skills).find(k => {
     const nm = (skills[k]?.label || skills[k]?.name || k).toString().toLowerCase();
     return nm === evasionName.toLowerCase();
   });
   if (key && typeof skills[key]?.roll === "function") {
-    try { log(`rollEvasion via system.skills["${key}"].roll()`); return await skills[key].roll(); }
+    try { log(`tryAPIEvasionRoll: system.skills["${key}"].roll()`); await skills[key].roll(); return true; }
     catch (e) { warn(`skills["${key}"].roll failed`, e); }
   }
+  // C) sheet handler
   if (actor.sheet && typeof actor.sheet._onRollSkill === "function") {
-    try { log(`rollEvasion via actor.sheet._onRollSkill("${evasionName}")`); return await actor.sheet._onRollSkill({ skill: evasionName }); }
+    try { log(`tryAPIEvasionRoll: actor.sheet._onRollSkill("${evasionName}")`); await actor.sheet._onRollSkill({ skill: evasionName }); return true; }
     catch (e) { warn("sheet._onRollSkill failed", e); }
   }
-  return null;
+  return false;
 }
 
-// ---- Main flow ----
+// --- Click the Evasion control on the defender's sheet (DOM path) ---
+async function clickSheetEvasion(actor) {
+  // Ensure sheet is rendered
+  if (!actor.sheet.rendered) {
+    log("Opening defender sheet to click Evasion…");
+    await actor.sheet.render(true, { focus: false });
+    // Allow a quick render tick
+    await sleep(50);
+  }
+
+  const el = actor.sheet.element;
+  if (!el || el.length === 0) { warn("Sheet element missing for actor", actor); return false; }
+
+  // Common selectors to find the Evasion row/button on CPRED sheets
+  // We search for a row containing "Evasion" then a button-like element on that row.
+  const rows = el.find("*").filter((i, n) => /evasion/i.test(n.textContent || ""));
+  if (!rows.length) {
+    warn("Could not find any element containing 'Evasion' text on sheet.");
+    return false;
+  }
+
+  // Try to find a clickable in the nearest row/container
+  let clicked = false;
+  rows.each((i, node) => {
+    if (clicked) return;
+    const row = $(node).closest(".skill, .list-row, tr, .flexrow, .item, .rollable, .cpred-skill, .cpred-row, .grid");
+    const button = row.find('[data-action="roll-skill"], [data-action="roll"], [data-action*="roll"], button, .rollable, .roll, .fa-dice, .fa-hand-fist, .fa-hand-back-fist').first();
+    if (button && button.length) {
+      log("Clicking Evasion control on sheet…");
+      // Click twice in case first opens options, second confirms
+      button.trigger("click");
+      // safety second click a moment later
+      setTimeout(() => button.trigger("click"), 80);
+      clicked = true;
+    }
+  });
+
+  if (!clicked) warn("Found 'Evasion' row but no clickable control.");
+  return clicked;
+}
+
+// --- MAIN HOOKS ---
 Hooks.once("ready", () => {
   log(`READY — system=${game.system?.id} user=${game.user?.id} isGM=${game.user?.isGM}`);
 
-  // 0) Full-spectrum logs (so we see what's happening)
+  // Diagnostics
   Hooks.on("preCreateChatMessage", (_doc, data) => {
-    const preview = (data?.content || "").replace(/\s+/g, " ").slice(0, 120);
+    const preview = (data?.content || "").replace(/\s+/g, " ").slice(0, 140);
     log("preCreateChatMessage", { hasRolls: !!data?.rolls?.length, preview });
   });
   Hooks.on("createChatMessage", (msg) => {
     const total = extractTotal(msg);
-    const preview = (msg?.content || "").replace(/\s+/g, " ").slice(0, 120);
+    const preview = (msg?.content || "").replace(/\s+/g, " ").slice(0, 140);
     log("createChatMessage", { isRoll: msg.isRoll, total, authorId: msg.authorId, preview });
   });
   Hooks.on("renderChatMessage", (msg, html) => {
-    const text = (html?.[0]?.innerText || msg.content || "").replace(/\s+/g, " ").slice(0, 120);
+    const text = (html?.[0]?.innerText || msg.content || "").replace(/\s+/g, " ").slice(0, 140);
     log("renderChatMessage", { isRoll: msg.isRoll, text });
   });
 
-  // A) CARD PATH → mark PENDING when a melee weapon card renders
+  // A) Mark PENDING on melee weapon cards (Unarmed/Wolvers/etc.)
   Hooks.on("renderChatMessage", (msg, html) => {
-    if (msg?.rolls?.length) return; // Skip actual roll messages
+    if (msg?.rolls?.length) return; // not a pure card
     const raw = html?.[0]?.innerText || msg.content || "";
-    if (looksLikeMeleeText(raw)) { log("Melee card detected", { snippet: raw.slice(0, 200) }); setPending(); }
+    if (looksLikeMeleeText(raw)) {
+      log("Melee card detected", { snippet: raw.slice(0, 200) });
+      setPending();
+    }
   });
 
-  // B) ROLL PATH (works for both pending roll OR direct sheet roll that renders a roll ChatMessage)
+  // B) If a roll message appears and looks like melee (pending or direct melee text), handle it
   Hooks.on("createChatMessage", async (msg) => {
     const total = extractTotal(msg);
     if (total === null) return;
 
-    const directMelee = looksLikeMeleeText(textify(msg.content));
-    const treatAsMelee = hasPending() || directMelee;
-    log(`Roll seen: total=${total} pending=${hasPending()} directMelee=${directMelee}`);
+    const isDirectMelee = looksLikeMeleeText(textify(msg.content));
+    const treatAsMelee = hasPending() || isDirectMelee;
+    log(`Roll seen: total=${total} pending=${hasPending()} directMelee=${isDirectMelee}`);
     if (!treatAsMelee) return;
-
     if (hasPending()) clearPending();
+
     await handleDetectedAttack(total);
   });
 
-  // C) SHEET CLICK PATH — listen for clicks that look like the **fist** on CPRED sheets
-  // We match several common patterns: data-action="attack", elements with 'attack' in title/aria-label,
-  // or common icon classes. Adjust/selectors if your sheet theme differs.
+  // C) Sheet Click path: fist/attack click on sheets (no roll message case)
   document.addEventListener("click", async (ev) => {
     const el = ev.target instanceof Element ? ev.target : null;
     if (!el) return;
-    const btn = el.closest('[data-action="attack"], [data-action="roll-attack"], .attack, [title*="Attack"], [aria-label*="Attack"], .fa-hand-fist, .fa-fist, .fa-hand-back-fist');
+    const btn = el.closest('[data-action="attack"], [data-action="roll-attack"], .attack, [title*="Attack"], [aria-label*="Attack"], .fa-hand-fist, .fa-hand-back-fist');
     if (!btn) return;
 
-    // We only care about attacks that are likely melee — narrow it a bit:
-    const rowText = (btn.closest(".item, .weapon, .rollcard, .window-content")?.innerText || "").toLowerCase();
-    const isProbablyMelee = looksLikeMeleeText(rowText);
-    if (!isProbablyMelee) { log("Attack click detected, but not obviously melee; skipping sheet-click path."); return; }
+    // Heuristic: only treat as melee if row text whispers “melee”
+    const rowText = (btn.closest(".item, .weapon, .rollcard, .window-content, .sheet")?.innerText || "").toLowerCase();
+    if (!looksLikeMeleeText(rowText)) return;
 
-    log("Sheet attack click detected (probable melee). Waiting briefly for roll message…");
-    // Give the system a moment to post a roll message; if none shows, we still fire evasion.
-    await sleep(ROLL_WAIT_MS);
-
-    // If a roll message showed, our createChatMessage handler will already have handled evasion.
-    // To avoid double-firing, we don’t try to detect that; we just *attempt* evasion and accept that
-    // createChatMessage may have run already (the conditions below will prevent duplicates).
-    await handleDetectedAttack(null); // null = no known attack total (we'll roll evasion without comparison)
-  }, true); // capture=true to get the event early
+    log("Sheet attack click detected (likely melee).");
+    // small grace; if a roll is going to appear, let the ‘createChatMessage’ path handle it.
+    setTimeout(() => handleDetectedAttack(null), 250);
+  }, true);
 });
 
-// Central handler once we decide “this is a melee attack”
+// Central “we have a melee attack” handler
 async function handleDetectedAttack(attackTotalOrNull) {
-  info(`Roll seen${attackTotalOrNull !== null ? `: ${attackTotalOrNull}` : ""} (melee)`);
+  info(`Melee attack detected${attackTotalOrNull !== null ? ` (roll ${attackTotalOrNull})` : ""}`);
 
-  // Ensure exactly one target
+  // Need exactly 1 target
   const targets = Array.from(game.user.targets || []);
   log("Targets:", targets.map(t => ({ id: t.id, name: t.name })));
-  if (targets.length !== 1) { oops(`Need exactly one target for auto-evasion (have ${targets.length}).`); return; }
+  if (targets.length !== 1) { warnN(`Need exactly one target selected (have ${targets.length}).`); return; }
 
   const tDoc = targets[0]?.document;
-  if (!tDoc) { oops("Target has no TokenDocument."); return; }
+  if (!tDoc) { warnN("Target has no TokenDocument."); return; }
 
   const payload = {
     sceneId: tDoc.parent?.id || canvas.scene?.id,
@@ -155,86 +212,51 @@ async function handleDetectedAttack(attackTotalOrNull) {
   };
 
   if (game.user.isGM) {
-    log(`Solo GM: resolving evasion locally for ${payload.defenderName}`);
     await resolveEvasionLocal(payload);
   } else {
-    log(`Multiplayer: emitting socket to GM`);
     game.socket.emit(SOCKET, payload);
-    info("Sent attack to GM for auto-evasion…");
+    info("Sent to GM for auto-evasion…");
   }
 }
 
+// Resolve Evasion locally (GM) with robust capture & sheet-click fallback
 async function resolveEvasionLocal(p) {
   const scene = game.scenes.get(p.sceneId) || canvas.scene;
   const tDoc = scene?.tokens.get(p.tokenId);
   const actor = tDoc?.actor;
-
-  if (!actor) {
-    oops(`No actor found for token ${p.tokenId}.`);
-    warn("resolveEvasionLocal: no actor", { p, scene, tDoc });
-    return;
-  }
+  if (!actor) { warnN(`No actor for token ${p.tokenId}.`); return; }
 
   info(`Rolling Evasion for ${actor.name}…`);
 
-  // --- Capture the next CPRED roll message for THIS actor (within 4s) ---
-  let captured = false;
-  const captureWindowMs = 4000;
+  // 1) Try API methods; capture the resulting chat total.
+  let total = null;
+  const capPromise = captureNextTotalForActor(actor, SHEET_ROLL_WAIT_MS);
+  const apiTriggered = await tryAPIEvasionRoll(actor, p.evasionKey || "Evasion");
+  total = await capPromise;
 
-  const off = Hooks.on("createChatMessage", (msg) => {
-    // Only consider messages from this actor and with a real roll
-    const sameActor =
-      (msg.speaker?.actor === actor.id) ||
-      (msg.speaker?.alias && msg.speaker.alias === actor.name);
-    const total = msg?.rolls?.[0]?.total;
+  if (!apiTriggered || total === null) {
+    log("API roll didn’t yield a readable total; trying sheet click…");
+    // 2) Click the sheet Evasion control; capture again
+    const cap2 = captureNextTotalForActor(actor, SHEET_ROLL_WAIT_MS);
+    const clicked = await clickSheetEvasion(actor);
+    total = await cap2;
 
-    if (!sameActor || typeof total !== "number") return;
+    if (!clicked) log("Sheet click path: no clickable control found.");
+  }
 
-    captured = true;
-    Hooks.off("createChatMessage", off);
-
-    // Post our combined summary (don’t create “Evasion: ?” stubs)
+  if (total !== null) {
+    info(`Evasion = ${total} (${actor.name})`);
     let content = `<b>${p.defenderName || actor.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${total}</b>`;
     if (typeof p.attackTotal === "number") {
       const outcome = p.attackTotal > total ? "HIT" : "DODGED";
       content += ` — <b>${outcome}</b> (Attack ${p.attackTotal} vs Evasion ${total})`;
     }
-    ChatMessage.create({ speaker: ChatMessage.getSpeaker({ actor }), content });
-  });
-
-  // --- Perform the evasion roll (CPRED will post its own chat message) ---
-  let ev = null;
-  try {
-    if (typeof actor.rollSkill === "function") {
-      ev = await actor.rollSkill(p.evasionKey || "Evasion");
-    } else {
-      // fallback strategies (kept just in case)
-      const skills = foundry.utils.getProperty(actor, "system.skills") || {};
-      const key = Object.keys(skills).find(k => {
-        const nm = (skills[k]?.label || skills[k]?.name || k).toString().toLowerCase();
-        return nm === (p.evasionKey || "Evasion").toLowerCase();
-      });
-      if (key && typeof skills[key]?.roll === "function") ev = await skills[key].roll();
-      else if (actor.sheet && typeof actor.sheet._onRollSkill === "function") {
-        ev = await actor.sheet._onRollSkill({ skill: p.evasionKey || "Evasion" });
-      }
-    }
-  } catch (e) {
-    warn("Evasion roll threw", e);
+    await ChatMessage.create({ speaker: ChatMessage.getSpeaker({ actor }), content });
+    return;
   }
 
-  // Wait briefly for CPRED to emit the chat message we hooked above
-  const start = Date.now();
-  while (!captured && Date.now() - start < captureWindowMs) {
-    await new Promise(r => setTimeout(r, 50));
-  }
-  if (!captured) Hooks.off("createChatMessage", off);
-
-  // If we captured, we're done (summary already posted).
-  if (captured) return;
-
-  // If we didn’t capture a total, post a clickable fallback button (manual)
-  oops(`Auto Evasion didn’t yield a detectable result for ${actor.name} — posting a button.`);
+  // 3) Final fallback: post a button
+  warnN(`Auto Evasion could not be read for ${actor.name}.`);
   const msg = await ChatMessage.create({
     speaker: ChatMessage.getSpeaker({ actor }),
     content: `
@@ -251,52 +273,24 @@ async function resolveEvasionLocal(p) {
       const a = game.actors.get(aId);
       if (!a) return;
 
-      // Do the manual roll
-      let r = null;
-      try {
-        if (typeof a.rollSkill === "function") r = await a.rollSkill(p.evasionKey || "Evasion");
-        else {
-          const skills = foundry.utils.getProperty(a, "system.skills") || {};
-          const key = Object.keys(skills).find(k => {
-            const nm = (skills[k]?.label || skills[k]?.name || k).toString().toLowerCase();
-            return nm === (p.evasionKey || "Evasion").toLowerCase();
-          });
-          if (key && typeof skills[key]?.roll === "function") r = await skills[key].roll();
-          else if (a.sheet && typeof a.sheet._onRollSkill === "function") r = await a.sheet._onRollSkill({ skill: p.evasionKey || "Evasion" });
-        }
-      } catch (e) { warn("Manual Evasion roll error", e); }
+      // Try click path again in manual mode
+      const cap = captureNextTotalForActor(a, SHEET_ROLL_WAIT_MS);
+      const triggered = await tryAPIEvasionRoll(a, p.evasionKey || "Evasion");
+      let t = await cap;
 
-      // Try to read the next chat message with a total (same capture trick)
-      let manualTotal = null;
-      const off2 = Hooks.on("createChatMessage", (m2) => {
-        const sameActor2 =
-          (m2.speaker?.actor === a.id) ||
-          (m2.speaker?.alias && m2.speaker.alias === a.name);
-        const tot2 = m2?.rolls?.[0]?.total;
-        if (!sameActor2 || typeof tot2 !== "number") return;
-        manualTotal = tot2;
-        Hooks.off("createChatMessage", off2);
-        let content = `<b>${a.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${manualTotal}</b>`;
-        if (typeof atk === "number") {
-          const outcome = atk > manualTotal ? "HIT" : "DODGED";
-          content += ` — <b>${outcome}</b> (Attack ${atk} vs Evasion ${manualTotal})`;
-        }
-        ChatMessage.create({ speaker: ChatMessage.getSpeaker({ actor: a }), content });
-      });
+      if (t === null) {
+        const cap2 = captureNextTotalForActor(a, SHEET_ROLL_WAIT_MS);
+        const clicked = await clickSheetEvasion(a);
+        t = await cap2;
+        log("Manual button: apiTriggered=", triggered, "clicked=", clicked, "total=", t);
+      }
 
-      const start2 = Date.now();
-      while (manualTotal === null && Date.now() - start2 < 4000) {
-        await new Promise(r => setTimeout(r, 50));
+      let content = `<b>${a.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${t ?? "?"}</b>`;
+      if (typeof atk === "number" && typeof t === "number") {
+        const outcome = atk > t ? "HIT" : "DODGED";
+        content += ` — <b>${outcome}</b> (Attack ${atk} vs Evasion ${t})`;
       }
-      if (manualTotal === null) Hooks.off("createChatMessage", off2);
-      if (manualTotal === null) {
-        // Final fallback: post without comparison
-        ChatMessage.create({
-          speaker: ChatMessage.getSpeaker({ actor: a }),
-          content: `<b>${a.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>.`
-        });
-      }
+      ChatMessage.create({ speaker: ChatMessage.getSpeaker({ actor: a }), content });
     });
   });
 }
-
