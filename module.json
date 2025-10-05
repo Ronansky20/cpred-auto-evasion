@@ -12,8 +12,12 @@
   ],
   "esmodules": ["scripts/auto-evasion.js"],
   "relationships": {
-    "requires": [
-      { "id": "cyberpunk-red-core" }
+    "systems": [
+      {
+        "id": "cyberpunk-red-core",
+        "type": "system",
+        "manifest": "https://raw.githubusercontent.com/rgflorence/CyberpunkRED-core/main/system.json"
+      }
     ]
   },
   "url": "https://github.com/Ronansky20/cpred-auto-evasion",
