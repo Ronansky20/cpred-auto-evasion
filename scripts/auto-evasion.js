@@ -174,19 +174,34 @@ function lookLikeCPREDMeleeByContent(msg, cfg) {
 }
 
 function messageIsMeleeAttackCPRED(msg, cfg) {
-  // Must be from the CPRED system
-  if (!isCPRED()) return false;
+  // must be CPRED system
+  if (game.system?.id !== "cyberpunk-red-core") return false;
 
-  // Roll should exist and be visible
-  const total = extractAttackTotal(msg);
-  if (total == null) return false;
+  // must contain a roll result (item cards won't)
+  const r = msg.rolls?.[0];
+  if (!r || typeof r.total !== "number") return false;
 
-  // Prefer structured flags if present
-  const flagsCheck = lookLikeCPREDMeleeByFlags(msg, cfg);
-  if (typeof flagsCheck === "boolean") return flagsCheck;
+  // Try CPRED flags first (if present)
+  const flags = msg.flags || {};
+  const f = flags["cyberpunk-red-core"] || flags["cyberpunkredcore"] || flags["cpred"] || null;
+  if (f) {
+    const rollType = (f.rollType || "").toLowerCase();
+    const weaponType = (f.weaponType || f.category || "").toLowerCase();
+    const skillName = (f.skillName || "").toLowerCase();
+    const skillHit = cfg.meleeSkillNames.some(s => s.toLowerCase() === skillName);
+    const weaponHit = weaponType === "melee";
+    if (cfg.detectionMode === "skills") return rollType && skillHit;
+    if (cfg.detectionMode === "weapons") return rollType && weaponHit;
+    return rollType && (skillHit || weaponHit);
+  }
 
-  // Fallback to content parsing tuned for CPRED
-  return lookLikeCPREDMeleeByContent(msg, cfg);
+  // Fallback: parse CPRED-style chat content
+  const txt = (msg.content || "").toLowerCase();
+  const skillHit = cfg.meleeSkillNames.some(s => txt.includes(s.toLowerCase()));
+  const weaponHit = /\bmelee\b/.test(txt);
+  if (cfg.detectionMode === "skills") return skillHit;
+  if (cfg.detectionMode === "weapons") return weaponHit;
+  return skillHit || weaponHit;
 }
 
 // ------------------ SOCKET & HOOKS ------------------
@@ -239,7 +254,7 @@ Hooks.once("ready", () => {
   Hooks.on("createChatMessage", async (msg) => {
     try {
       // Only the user who created the message should react (so we can read their targets)
-      if (msg.user?.id !== game.user.id) return;
+      if (msg.authorId !== game.user.id) return;
 
       const cfg = getCfg();
       if (!messageIsMeleeAttackCPRED(msg, cfg)) return;
