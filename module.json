@@ -1,0 +1,22 @@
+{
+  "id": "cpred-auto-evasion",
+  "title": "CPRED Auto Evasion (Melee)",
+  "description": "Automatically triggers defender Evasion when a melee attack is rolled in Cyberpunk RED Core.",
+  "version": "1.0.0",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "12"
+  },
+  "authors": [
+    { "name": "Ronansky20" }
+  ],
+  "esmodules": ["scripts/auto-evasion.js"],
+  "relationships": {
+    "requires": [
+      { "id": "cyberpunk-red-core" }
+    ]
+  },
+  "url": "https://github.com/Ronansky20/cpred-auto-evasion",
+  "manifest": "https://raw.githubusercontent.com/Ronansky20/cpred-auto-evasion/main/module.json",
+  "download": "https://github.com/Ronansky20/cpred-auto-evasion/archive/refs/heads/main.zip"
+}
