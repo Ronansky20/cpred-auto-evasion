@@ -1,18 +1,15 @@
-// CPRED Auto Evasion (Diagnostic Build) — Foundry VTT v12
-// -------------------------------------------------------
-// Adds loud notifications and console logs so you can confirm every step.
-// Works solo GM or multiplayer. Detects melee weapon cards (Unarmed/Wolvers/etc.),
-// then treats the next roll as the attack and rolls Evasion on the target.
+// CPRED Auto Evasion — Diagnostic v2 (Foundry V12)
+// Loud, step-by-step toasts and logs. Works solo GM or with players.
+// Detects Unarmed/Wolvers/any melee weapon card → next roll = attack → auto-roll Evasion on the single target.
 //
-// Steps you'll see via toasts:
-// - "Melee card detected" when a card like Unarmed or Wolvers appears.
-// - "Roll seen..." when dice roll is posted.
-// - "Rolling Evasion..." when the system triggers the defense roll.
+// New in v2:
+// - Small delay before reading targets, to avoid race conditions.
+// - Toast/log at every step (targets, tokenId, actor name).
+// - Multiple evasion roll strategies + final fallback: chat button to roll Evasion manually.
 
 const MOD = "cpred-auto-evasion";
 const SOCKET = `module.${MOD}`;
 
-// --- Pending timer: "I saw a melee card, next roll is melee attack" ---
 let pendingUntil = 0;
 const PENDING_MS = 8000;
 
@@ -27,35 +24,49 @@ function clearPending() {
   console.log(`[${MOD}] PENDING CLEARED`);
 }
 
-// --- Evasion roller ---
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 async function rollEvasion(actor, evasionName = "Evasion") {
+  // Strategy A: system helper
   if (typeof actor.rollSkill === "function") {
-    try { return await actor.rollSkill(evasionName); } catch (e) { console.warn(`[${MOD}] actor.rollSkill failed`, e); }
+    try {
+      console.log(`[${MOD}] rollEvasion via actor.rollSkill("${evasionName}")`);
+      const r = await actor.rollSkill(evasionName);
+      return r;
+    } catch (e) { console.warn(`[${MOD}] actor.rollSkill failed`, e); }
   }
+  // Strategy B: find labeled skill object with .roll()
   const skills = foundry.utils.getProperty(actor, "system.skills") || {};
   const key = Object.keys(skills).find(k => {
     const nm = (skills[k]?.label || skills[k]?.name || k).toString().toLowerCase();
     return nm === evasionName.toLowerCase();
   });
   if (key && skills[key]?.roll) {
-    try { return await skills[key].roll(); } catch (e) { console.warn(`[${MOD}] skill.roll failed`, e); }
+    try {
+      console.log(`[${MOD}] rollEvasion via system.skills["${key}"].roll()`);
+      const r = await skills[key].roll();
+      return r;
+    } catch (e) { console.warn(`[${MOD}] skills["${key}"].roll failed`, e); }
   }
+  // Strategy C: some sheets expose internal handler
   if (actor.sheet && typeof actor.sheet._onRollSkill === "function") {
-    try { return await actor.sheet._onRollSkill({ skill: evasionName }); } catch (e) { console.warn(`[${MOD}] sheet._onRollSkill failed`, e); }
+    try {
+      console.log(`[${MOD}] rollEvasion via actor.sheet._onRollSkill("${evasionName}")`);
+      const r = await actor.sheet._onRollSkill({ skill: evasionName });
+      return r;
+    } catch (e) { console.warn(`[${MOD}] sheet._onRollSkill failed`, e); }
   }
-  ui.notifications.error(`[${MOD}] Couldn't roll "${evasionName}" on ${actor.name}.`);
   return null;
 }
 
-// --- Main hooks ---
 Hooks.once("ready", () => {
-  console.log(`[${MOD}] READY — system=${game.system?.id} user=${game.user?.id}`);
+  console.log(`[${MOD}] READY — system=${game.system?.id} user=${game.user?.id} isGM=${game.user?.isGM}`);
 
-  // Detect melee weapon cards (Unarmed, Wolvers, etc.)
+  // 1) Mark pending when a melee weapon card renders (Unarmed/Wolvers/etc.)
   Hooks.on("renderChatMessage", (msg, html) => {
-    if (msg?.rolls?.length) return; // skip if it's already a roll
-
+    if (msg?.rolls?.length) return; // skip actual roll messages
     const text = (html?.[0]?.innerText || msg.content || "").toLowerCase();
+
     const looksMeleeCard =
       text.includes("melee weapon") ||
       text.includes("unarmed") ||
@@ -63,31 +74,42 @@ Hooks.once("ready", () => {
       (text.includes("rof") && text.includes("damage") && text.includes("hands") && text.includes("melee"));
 
     if (looksMeleeCard) {
-      console.log(`[${MOD}] melee weapon/unarmed card detected`, { snippet: text.slice(0, 120) });
+      console.log(`[${MOD}] Melee card detected`, { snippet: text.slice(0, 160) });
       setPending();
     }
   });
 
-  // Detect roll following melee card
+  // 2) When a roll appears and we're pending, treat it as the melee attack
   Hooks.on("createChatMessage", async (msg) => {
     const roll = msg?.rolls?.[0];
     const total = (roll && typeof roll.total === "number") ? roll.total : null;
     if (total === null) return;
 
-    console.log(`[${MOD}] createChatMessage total=${total}, pending=${hasPending()}`);
+    console.log(`[${MOD}] Roll seen → total=${total}, pending=${hasPending()}, authorId=${msg.authorId}`);
     if (!hasPending()) return;
-
     clearPending();
+
     ui.notifications.info(`[${MOD}] Roll seen: ${total} (pending melee)`, { permanent: false });
 
+    // Wait one tick to ensure targeting state is committed
+    await sleep(50);
+
     const targets = Array.from(game.user.targets || []);
+    console.log(`[${MOD}] Targets length=${targets.length}`, targets.map(t => t.name));
     if (targets.length !== 1) {
-      ui.notifications.warn(`[${MOD}] Need exactly one target selected for auto-evasion. (Have ${targets.length})`, { permanent: false });
+      ui.notifications.warn(
+        `[${MOD}] Need exactly one target selected for auto-evasion (have ${targets.length}).`,
+        { permanent: false }
+      );
       return;
     }
 
     const tDoc = targets[0]?.document;
-    if (!tDoc) return;
+    if (!tDoc) {
+      ui.notifications.warn(`[${MOD}] Target has no TokenDocument — cannot resolve actor.`, { permanent: false });
+      return;
+    }
+    console.log(`[${MOD}] Target tokenId=${tDoc.id} sceneId=${tDoc.parent?.id}`);
 
     const sceneId = tDoc.parent?.id || canvas.scene?.id;
     const tokenId = tDoc.id;
@@ -95,16 +117,17 @@ Hooks.once("ready", () => {
     const attackTotal = total;
     const evasionKey = "Evasion";
 
-    console.log(`[${MOD}] melee attack detected → ${defenderName} (attack=${attackTotal})`);
     if (game.user.isGM) {
+      console.log(`[${MOD}] Solo GM path: resolving evasion locally for ${defenderName}`);
       await resolveEvasionLocal({ sceneId, tokenId, defenderName, attackTotal, evasionKey });
     } else {
+      console.log(`[${MOD}] Multiplayer path: sending socket to GM`);
       game.socket.emit(SOCKET, { sceneId, tokenId, defenderName, attackTotal, evasionKey });
       ui.notifications.info(`[${MOD}] Sent attack to GM for auto-evasion...`, { permanent: false });
     }
   });
 
-  // GM handler for multiplayer tables
+  // 3) GM socket handler (multiplayer tables)
   game.socket.on(SOCKET, async (p) => {
     if (!game.user.isGM) return;
     console.log(`[${MOD}] GM socket received`, p);
@@ -113,24 +136,56 @@ Hooks.once("ready", () => {
   });
 });
 
-// --- Shared resolution logic ---
+// Shared resolver used by both local GM and socket GM
 async function resolveEvasionLocal(p) {
   const scene = game.scenes.get(p.sceneId) || canvas.scene;
   const tDoc = scene?.tokens.get(p.tokenId);
   const actor = tDoc?.actor;
+
   if (!actor) {
     ui.notifications.warn(`[${MOD}] No actor found for token ${p.tokenId}.`, { permanent: false });
+    console.warn(`[${MOD}] resolveEvasionLocal: no actor`, { p, scene, tDoc });
     return;
   }
+
+  ui.notifications.info(`[${MOD}] Rolling Evasion for ${actor.name}...`, { permanent: false });
 
   const ev = await rollEvasion(actor, p.evasionKey || "Evasion");
   const eTotal = ev?.total ?? null;
 
-  ui.notifications.info(`[${MOD}] Evasion roll: ${eTotal ?? "?"} (${actor.name})`, { permanent: false });
+  if (eTotal === null) {
+    ui.notifications.warn(`[${MOD}] Could not auto-roll Evasion on ${actor.name} — posting a button instead.`, { permanent: false });
 
-  let content = `<b>${p.defenderName || actor.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>`;
-  if (typeof eTotal === "number") content += `: <b>${eTotal}</b>`;
-  if (typeof p.attackTotal === "number" && typeof eTotal === "number") {
+    // Post a fallback button so you can click to roll evasion manually
+    const msg = await ChatMessage.create({
+      speaker: ChatMessage.getSpeaker({ actor }),
+      content: `
+        <div>[${MOD}] <b>${actor.name}</b>: Auto-roll failed. 
+        <button class="cpred-evasion-btn" data-actor-id="${actor.id}">Roll Evasion</button>
+        ${typeof p.attackTotal === "number" ? `(Attack ${p.attackTotal})` : ""}</div>`
+    });
+
+    Hooks.once("renderChatMessage", (_m, html) => {
+      html.find(".cpred-evasion-btn").on("click", async (ev) => {
+        const aId = ev.currentTarget.dataset.actorId;
+        const a = game.actors.get(aId);
+        if (!a) return;
+        const r = await rollEvasion(a, p.evasionKey || "Evasion");
+        const t = r?.total ?? "?";
+        ChatMessage.create({
+          speaker: ChatMessage.getSpeaker({ actor: a }),
+          content: `<b>${a.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${t}</b>${typeof p.attackTotal==="number" && typeof t==="number" ? ` — ${p.attackTotal > t ? "<b>HIT</b>" : "<b>DODGED</b>"} (Attack ${p.attackTotal} vs Evasion ${t})` : ""}`
+        });
+      });
+    });
+
+    return;
+  }
+
+  ui.notifications.info(`[${MOD}] Evasion roll = ${eTotal} (${actor.name})`, { permanent: false });
+
+  let content = `<b>${p.defenderName || actor.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${eTotal}</b>`;
+  if (typeof p.attackTotal === "number") {
     const outcome = p.attackTotal > eTotal ? "HIT" : "DODGED";
     content += ` — <b>${outcome}</b> (Attack ${p.attackTotal} vs Evasion ${eTotal})`;
   }
