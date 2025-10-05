@@ -169,51 +169,134 @@ async function resolveEvasionLocal(p) {
   const tDoc = scene?.tokens.get(p.tokenId);
   const actor = tDoc?.actor;
 
-  if (!actor) { oops(`No actor found for token ${p.tokenId}.`); warn("resolveEvasionLocal: no actor", { p, scene, tDoc }); return; }
-
-  info(`Rolling Evasion for ${actor.name}…`);
-  const ev = await rollEvasion(actor, p.evasionKey || "Evasion");
-  const eTotal = ev?.total ?? null;
-
-  if (eTotal === null) {
-    oops(`Auto-roll failed on ${actor.name} — posting a button.`);
-    const msg = await ChatMessage.create({
-      speaker: ChatMessage.getSpeaker({ actor }),
-      content: `
-        <div>[${MOD}] <b>${actor.name}</b>: Auto Evasion failed.
-        <button class="cpred-evasion-btn" data-actor-id="${actor.id}" data-attack="${p.attackTotal ?? ""}">Roll Evasion</button>
-      </div>`
-    });
-
-    Hooks.once("renderChatMessage", (_m, html) => {
-      html.find(".cpred-evasion-btn").on("click", async (ev) => {
-        const aId = ev.currentTarget.dataset.actorId;
-        const atk = Number(ev.currentTarget.dataset.attack) || null;
-        const a = game.actors.get(aId);
-        if (!a) return;
-        const r = await rollEvasion(a, p.evasionKey || "Evasion");
-        const t = r?.total ?? "?";
-        let content = `<b>${a.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${t}</b>`;
-        if (typeof atk === "number" && typeof t === "number") {
-          content += ` — <b>${atk > t ? "HIT" : "DODGED"}</b> (Attack ${atk} vs Evasion ${t})`;
-        }
-        ChatMessage.create({ speaker: ChatMessage.getSpeaker({ actor: a }), content });
-      });
-    });
-
+  if (!actor) {
+    oops(`No actor found for token ${p.tokenId}.`);
+    warn("resolveEvasionLocal: no actor", { p, scene, tDoc });
     return;
   }
 
-  if (p.attackTotal !== null && typeof p.attackTotal === "number") {
-    const outcome = p.attackTotal > eTotal ? "HIT" : "DODGED";
-    await ChatMessage.create({
-      speaker: ChatMessage.getSpeaker({ actor }),
-      content: `<b>${p.defenderName || actor.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${eTotal}</b> — <b>${outcome}</b> (Attack ${p.attackTotal} vs Evasion ${eTotal})`
-    });
-  } else {
-    await ChatMessage.create({
-      speaker: ChatMessage.getSpeaker({ actor }),
-      content: `<b>${p.defenderName || actor.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${eTotal}</b>`
-    });
+  info(`Rolling Evasion for ${actor.name}…`);
+
+  // --- Capture the next CPRED roll message for THIS actor (within 4s) ---
+  let captured = false;
+  const captureWindowMs = 4000;
+
+  const off = Hooks.on("createChatMessage", (msg) => {
+    // Only consider messages from this actor and with a real roll
+    const sameActor =
+      (msg.speaker?.actor === actor.id) ||
+      (msg.speaker?.alias && msg.speaker.alias === actor.name);
+    const total = msg?.rolls?.[0]?.total;
+
+    if (!sameActor || typeof total !== "number") return;
+
+    captured = true;
+    Hooks.off("createChatMessage", off);
+
+    // Post our combined summary (don’t create “Evasion: ?” stubs)
+    let content = `<b>${p.defenderName || actor.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${total}</b>`;
+    if (typeof p.attackTotal === "number") {
+      const outcome = p.attackTotal > total ? "HIT" : "DODGED";
+      content += ` — <b>${outcome}</b> (Attack ${p.attackTotal} vs Evasion ${total})`;
+    }
+    ChatMessage.create({ speaker: ChatMessage.getSpeaker({ actor }), content });
+  });
+
+  // --- Perform the evasion roll (CPRED will post its own chat message) ---
+  let ev = null;
+  try {
+    if (typeof actor.rollSkill === "function") {
+      ev = await actor.rollSkill(p.evasionKey || "Evasion");
+    } else {
+      // fallback strategies (kept just in case)
+      const skills = foundry.utils.getProperty(actor, "system.skills") || {};
+      const key = Object.keys(skills).find(k => {
+        const nm = (skills[k]?.label || skills[k]?.name || k).toString().toLowerCase();
+        return nm === (p.evasionKey || "Evasion").toLowerCase();
+      });
+      if (key && typeof skills[key]?.roll === "function") ev = await skills[key].roll();
+      else if (actor.sheet && typeof actor.sheet._onRollSkill === "function") {
+        ev = await actor.sheet._onRollSkill({ skill: p.evasionKey || "Evasion" });
+      }
+    }
+  } catch (e) {
+    warn("Evasion roll threw", e);
   }
+
+  // Wait briefly for CPRED to emit the chat message we hooked above
+  const start = Date.now();
+  while (!captured && Date.now() - start < captureWindowMs) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  if (!captured) Hooks.off("createChatMessage", off);
+
+  // If we captured, we're done (summary already posted).
+  if (captured) return;
+
+  // If we didn’t capture a total, post a clickable fallback button (manual)
+  oops(`Auto Evasion didn’t yield a detectable result for ${actor.name} — posting a button.`);
+  const msg = await ChatMessage.create({
+    speaker: ChatMessage.getSpeaker({ actor }),
+    content: `
+      <div>[${MOD}] <b>${actor.name}</b>: Auto Evasion could not be read.
+      <button class="cpred-evasion-btn" data-actor-id="${actor.id}" data-attack="${p.attackTotal ?? ""}">
+        Roll Evasion
+      </button></div>`
+  });
+
+  Hooks.once("renderChatMessage", (_m, html) => {
+    html.find(".cpred-evasion-btn").on("click", async (ev) => {
+      const aId = ev.currentTarget.dataset.actorId;
+      const atk = Number(ev.currentTarget.dataset.attack) || null;
+      const a = game.actors.get(aId);
+      if (!a) return;
+
+      // Do the manual roll
+      let r = null;
+      try {
+        if (typeof a.rollSkill === "function") r = await a.rollSkill(p.evasionKey || "Evasion");
+        else {
+          const skills = foundry.utils.getProperty(a, "system.skills") || {};
+          const key = Object.keys(skills).find(k => {
+            const nm = (skills[k]?.label || skills[k]?.name || k).toString().toLowerCase();
+            return nm === (p.evasionKey || "Evasion").toLowerCase();
+          });
+          if (key && typeof skills[key]?.roll === "function") r = await skills[key].roll();
+          else if (a.sheet && typeof a.sheet._onRollSkill === "function") r = await a.sheet._onRollSkill({ skill: p.evasionKey || "Evasion" });
+        }
+      } catch (e) { warn("Manual Evasion roll error", e); }
+
+      // Try to read the next chat message with a total (same capture trick)
+      let manualTotal = null;
+      const off2 = Hooks.on("createChatMessage", (m2) => {
+        const sameActor2 =
+          (m2.speaker?.actor === a.id) ||
+          (m2.speaker?.alias && m2.speaker.alias === a.name);
+        const tot2 = m2?.rolls?.[0]?.total;
+        if (!sameActor2 || typeof tot2 !== "number") return;
+        manualTotal = tot2;
+        Hooks.off("createChatMessage", off2);
+        let content = `<b>${a.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>: <b>${manualTotal}</b>`;
+        if (typeof atk === "number") {
+          const outcome = atk > manualTotal ? "HIT" : "DODGED";
+          content += ` — <b>${outcome}</b> (Attack ${atk} vs Evasion ${manualTotal})`;
+        }
+        ChatMessage.create({ speaker: ChatMessage.getSpeaker({ actor: a }), content });
+      });
+
+      const start2 = Date.now();
+      while (manualTotal === null && Date.now() - start2 < 4000) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+      if (manualTotal === null) Hooks.off("createChatMessage", off2);
+      if (manualTotal === null) {
+        // Final fallback: post without comparison
+        ChatMessage.create({
+          speaker: ChatMessage.getSpeaker({ actor: a }),
+          content: `<b>${a.name}</b> rolls <i>${p.evasionKey || "Evasion"}</i>.`
+        });
+      }
+    });
+  });
 }
+
